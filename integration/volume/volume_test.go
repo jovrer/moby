@@ -14,9 +14,8 @@ import (
 	"github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/testutil/request"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
-	"gotest.tools/skip"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestVolumesCreateAndList(t *testing.T) {
@@ -61,7 +60,6 @@ func TestVolumesCreateAndList(t *testing.T) {
 }
 
 func TestVolumesRemove(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows", "FIXME")
 	defer setupTest(t)()
 	client := testEnv.APIClient()
 	ctx := context.Background()

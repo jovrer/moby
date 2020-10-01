@@ -17,9 +17,9 @@ import (
 	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/go-connections/nat"
 	"github.com/opencontainers/go-digest"
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
-	"gotest.tools/skip"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/skip"
 )
 
 func TestEmptyDockerfile(t *testing.T) {
@@ -50,7 +50,7 @@ func TestDockerfileOutsideTheBuildContext(t *testing.T) {
 	contextDir, cleanup := createTestTempDir(t, "", "builder-dockerfile-test")
 	defer cleanup()
 
-	expectedError := "Forbidden path outside the build context: ../../Dockerfile ()"
+	expectedError := "path outside the build context: ../../Dockerfile ()"
 	if runtime.GOOS == "windows" {
 		expectedError = "failed to resolve scoped path ../../Dockerfile ()"
 	}

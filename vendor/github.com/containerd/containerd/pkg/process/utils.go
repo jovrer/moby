@@ -39,8 +39,6 @@ import (
 const (
 	// RuncRoot is the path to the root runc state directory
 	RuncRoot = "/run/containerd/runc"
-	// StoppedPID is the pid assigned after a container has run and stopped
-	StoppedPID = -1
 	// InitPidFile name of the file that contains the init pid
 	InitPidFile = "init.pid"
 )
@@ -55,12 +53,6 @@ func (s *safePid) get() int {
 	s.Lock()
 	defer s.Unlock()
 	return s.pid
-}
-
-func (s *safePid) set(pid int) {
-	s.Lock()
-	s.pid = pid
-	s.Unlock()
 }
 
 type atomicBool int32
@@ -145,6 +137,8 @@ func checkKillError(err error) error {
 		strings.Contains(strings.ToLower(err.Error()), "no such process") ||
 		err == unix.ESRCH {
 		return errors.Wrapf(errdefs.ErrNotFound, "process already finished")
+	} else if strings.Contains(err.Error(), "does not exist") {
+		return errors.Wrapf(errdefs.ErrNotFound, "no such container")
 	}
 	return errors.Wrapf(err, "unknown error after kill")
 }

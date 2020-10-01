@@ -14,6 +14,7 @@ import (
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/rootfs"
+	"github.com/docker/docker/builder/builder-next/adapters/containerimage"
 	"github.com/docker/docker/distribution"
 	distmetadata "github.com/docker/docker/distribution/metadata"
 	"github.com/docker/docker/distribution/xfer"
@@ -23,12 +24,12 @@ import (
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/exporter"
 	localexporter "github.com/moby/buildkit/exporter/local"
 	tarexporter "github.com/moby/buildkit/exporter/tar"
 	"github.com/moby/buildkit/frontend"
-	gw "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver"
@@ -38,6 +39,7 @@ import (
 	"github.com/moby/buildkit/source/git"
 	"github.com/moby/buildkit/source/http"
 	"github.com/moby/buildkit/source/local"
+	"github.com/moby/buildkit/util/binfmt_misc"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/progress"
 	digest "github.com/opencontainers/go-digest"
@@ -65,7 +67,7 @@ type Opt struct {
 	Snapshotter       snapshot.Snapshotter
 	ContentStore      content.Store
 	CacheManager      cache.Manager
-	ImageSource       source.Source
+	ImageSource       *containerimage.Source
 	DownloadManager   distribution.RootFSDownloadManager
 	V2MetadataService distmetadata.V2MetadataService
 	Transport         nethttp.RoundTripper
@@ -139,7 +141,19 @@ func (w *Worker) Labels() map[string]string {
 }
 
 // Platforms returns one or more platforms supported by the image.
-func (w *Worker) Platforms() []ocispec.Platform {
+func (w *Worker) Platforms(noCache bool) []ocispec.Platform {
+	if noCache {
+		pm := make(map[string]struct{}, len(w.Opt.Platforms))
+		for _, p := range w.Opt.Platforms {
+			pm[platforms.Format(p)] = struct{}{}
+		}
+		for _, p := range binfmt_misc.SupportedPlatforms(noCache) {
+			if _, ok := pm[p]; !ok {
+				pp, _ := platforms.Parse(p)
+				w.Opt.Platforms = append(w.Opt.Platforms, pp)
+			}
+		}
+	}
 	if len(w.Opt.Platforms) == 0 {
 		return []ocispec.Platform{platforms.DefaultSpec()}
 	}
@@ -162,7 +176,7 @@ func (w *Worker) LoadRef(id string, hidden bool) (cache.ImmutableRef, error) {
 	if hidden {
 		opts = append(opts, cache.NoUpdateLastUsed)
 	}
-	return w.CacheManager.Get(context.TODO(), id, opts...)
+	return w.CacheManager().Get(context.TODO(), id, opts...)
 }
 
 // ResolveOp converts a LLB vertex into a LLB operation
@@ -172,9 +186,9 @@ func (w *Worker) ResolveOp(v solver.Vertex, s frontend.FrontendLLBBridge, sm *se
 		case *pb.Op_Source:
 			return ops.NewSourceOp(v, op, baseOp.Platform, w.SourceManager, sm, w)
 		case *pb.Op_Exec:
-			return ops.NewExecOp(v, op, baseOp.Platform, w.CacheManager, sm, w.MetadataStore, w.Executor, w)
+			return ops.NewExecOp(v, op, baseOp.Platform, w.CacheManager(), sm, w.MetadataStore, w.Executor(), w)
 		case *pb.Op_File:
-			return ops.NewFileOp(v, op, w.CacheManager, w.MetadataStore, w)
+			return ops.NewFileOp(v, op, w.CacheManager(), w.MetadataStore, w)
 		case *pb.Op_Build:
 			return ops.NewBuildOp(v, op, s, w)
 		}
@@ -183,33 +197,18 @@ func (w *Worker) ResolveOp(v solver.Vertex, s frontend.FrontendLLBBridge, sm *se
 }
 
 // ResolveImageConfig returns image config for an image
-func (w *Worker) ResolveImageConfig(ctx context.Context, ref string, opt gw.ResolveImageConfigOpt, sm *session.Manager) (digest.Digest, []byte, error) {
-	// ImageSource is typically source/containerimage
-	resolveImageConfig, ok := w.ImageSource.(resolveImageConfig)
-	if !ok {
-		return "", nil, errors.Errorf("worker %q does not implement ResolveImageConfig", w.ID())
-	}
-	return resolveImageConfig.ResolveImageConfig(ctx, ref, opt, sm)
-}
-
-// Exec executes a process directly on a worker
-func (w *Worker) Exec(ctx context.Context, meta executor.Meta, rootFS cache.ImmutableRef, stdin io.ReadCloser, stdout, stderr io.WriteCloser) error {
-	active, err := w.CacheManager.New(ctx, rootFS)
-	if err != nil {
-		return err
-	}
-	defer active.Release(context.TODO())
-	return w.Executor.Exec(ctx, meta, active, nil, stdin, stdout, stderr)
+func (w *Worker) ResolveImageConfig(ctx context.Context, ref string, opt llb.ResolveImageConfigOpt, sm *session.Manager, g session.Group) (digest.Digest, []byte, error) {
+	return w.ImageSource.ResolveImageConfig(ctx, ref, opt, sm, g)
 }
 
 // DiskUsage returns disk usage report
 func (w *Worker) DiskUsage(ctx context.Context, opt client.DiskUsageInfo) ([]*client.UsageInfo, error) {
-	return w.CacheManager.DiskUsage(ctx, opt)
+	return w.CacheManager().DiskUsage(ctx, opt)
 }
 
 // Prune deletes reclaimable build cache
 func (w *Worker) Prune(ctx context.Context, ch chan client.UsageInfo, info ...client.PruneInfo) error {
-	return w.CacheManager.Prune(ctx, ch, info...)
+	return w.CacheManager().Prune(ctx, ch, info...)
 }
 
 // Exporter returns exporter by name
@@ -279,7 +278,7 @@ func (w *Worker) PruneCacheMounts(ctx context.Context, ids []string) error {
 		for _, si := range sis {
 			for _, k := range si.Indexes() {
 				if k == id || strings.HasPrefix(k, id+":") {
-					if siCached := w.CacheManager.Metadata(si.ID()); siCached != nil {
+					if siCached := w.CacheManager().Metadata(si.ID()); siCached != nil {
 						si = siCached
 					}
 					if err := cache.CachePolicyDefault(si); err != nil {
@@ -292,7 +291,7 @@ func (w *Worker) PruneCacheMounts(ctx context.Context, ids []string) error {
 						return err
 					}
 					// if ref is unused try to clean it up right away by releasing it
-					if mref, err := w.CacheManager.GetMutable(ctx, si.ID()); err == nil {
+					if mref, err := w.CacheManager().GetMutable(ctx, si.ID()); err == nil {
 						go mref.Release(context.TODO())
 					}
 					break
@@ -315,7 +314,7 @@ func (w *Worker) getRef(ctx context.Context, diffIDs []layer.DiffID, opts ...cac
 		}
 		defer parent.Release(context.TODO())
 	}
-	return w.CacheManager.GetByBlob(context.TODO(), ocispec.Descriptor{
+	return w.CacheManager().GetByBlob(context.TODO(), ocispec.Descriptor{
 		Annotations: map[string]string{
 			"containerd.io/uncompressed": diffIDs[len(diffIDs)-1].String(),
 		},
@@ -381,6 +380,16 @@ func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (cache.I
 	}
 
 	return nil, errors.Errorf("unreachable")
+}
+
+// Executor returns executor.Executor for running processes
+func (w *Worker) Executor() executor.Executor {
+	return w.Opt.Executor
+}
+
+// CacheManager returns cache.Manager for accessing local storage
+func (w *Worker) CacheManager() cache.Manager {
+	return w.Opt.CacheManager
 }
 
 type discardProgress struct{}
@@ -474,10 +483,6 @@ func oneOffProgress(ctx context.Context, id string) func(err error) error {
 		_ = pw.Close()
 		return err
 	}
-}
-
-type resolveImageConfig interface {
-	ResolveImageConfig(ctx context.Context, ref string, opt gw.ResolveImageConfigOpt, sm *session.Manager) (digest.Digest, []byte, error)
 }
 
 type emptyProvider struct {

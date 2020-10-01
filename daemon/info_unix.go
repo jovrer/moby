@@ -19,13 +19,19 @@ import (
 
 // fillPlatformInfo fills the platform related info.
 func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) {
+	v.CgroupDriver = daemon.getCgroupDriver()
+	v.CgroupVersion = "1"
+	if sysInfo.CgroupUnified {
+		v.CgroupVersion = "2"
+	}
+
 	v.MemoryLimit = sysInfo.MemoryLimit
 	v.SwapLimit = sysInfo.SwapLimit
 	v.KernelMemory = sysInfo.KernelMemory
 	v.KernelMemoryTCP = sysInfo.KernelMemoryTCP
 	v.OomKillDisable = sysInfo.OomKillDisable
-	v.CPUCfsPeriod = sysInfo.CPUCfsPeriod
-	v.CPUCfsQuota = sysInfo.CPUCfsQuota
+	v.CPUCfsPeriod = sysInfo.CPUCfs
+	v.CPUCfsQuota = sysInfo.CPUCfs
 	v.CPUShares = sysInfo.CPUShares
 	v.CPUSet = sysInfo.Cpuset
 	v.PidsLimit = sysInfo.PidsLimit
@@ -81,32 +87,59 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 		v.InitCommit.ID = "N/A"
 	}
 
-	if !v.MemoryLimit {
-		v.Warnings = append(v.Warnings, "WARNING: No memory limit support")
-	}
-	if !v.SwapLimit {
-		v.Warnings = append(v.Warnings, "WARNING: No swap limit support")
-	}
-	if !v.KernelMemory {
-		v.Warnings = append(v.Warnings, "WARNING: No kernel memory limit support")
-	}
-	if !v.KernelMemoryTCP {
-		v.Warnings = append(v.Warnings, "WARNING: No kernel memory TCP limit support")
-	}
-	if !v.OomKillDisable {
-		v.Warnings = append(v.Warnings, "WARNING: No oom kill disable support")
-	}
-	if !v.CPUCfsQuota {
-		v.Warnings = append(v.Warnings, "WARNING: No cpu cfs quota support")
-	}
-	if !v.CPUCfsPeriod {
-		v.Warnings = append(v.Warnings, "WARNING: No cpu cfs period support")
-	}
-	if !v.CPUShares {
-		v.Warnings = append(v.Warnings, "WARNING: No cpu shares support")
-	}
-	if !v.CPUSet {
-		v.Warnings = append(v.Warnings, "WARNING: No cpuset support")
+	if v.CgroupDriver == cgroupNoneDriver {
+		if v.CgroupVersion == "2" {
+			v.Warnings = append(v.Warnings, "WARNING: Running in rootless-mode without cgroups. Systemd is required to enable cgroups in rootless-mode.")
+		} else {
+			v.Warnings = append(v.Warnings, "WARNING: Running in rootless-mode without cgroups. To enable cgroups in rootless-mode, you need to boot the system in cgroup v2 mode.")
+		}
+	} else {
+		if !v.MemoryLimit {
+			v.Warnings = append(v.Warnings, "WARNING: No memory limit support")
+		}
+		if !v.SwapLimit {
+			v.Warnings = append(v.Warnings, "WARNING: No swap limit support")
+		}
+		if !v.KernelMemoryTCP {
+			v.Warnings = append(v.Warnings, "WARNING: No kernel memory TCP limit support")
+		}
+		if !v.OomKillDisable {
+			v.Warnings = append(v.Warnings, "WARNING: No oom kill disable support")
+		}
+		if !v.CPUCfsQuota {
+			v.Warnings = append(v.Warnings, "WARNING: No cpu cfs quota support")
+		}
+		if !v.CPUCfsPeriod {
+			v.Warnings = append(v.Warnings, "WARNING: No cpu cfs period support")
+		}
+		if !v.CPUShares {
+			v.Warnings = append(v.Warnings, "WARNING: No cpu shares support")
+		}
+		if !v.CPUSet {
+			v.Warnings = append(v.Warnings, "WARNING: No cpuset support")
+		}
+		if v.CgroupVersion == "2" {
+			v.Warnings = append(v.Warnings, "WARNING: Support for cgroup v2 is experimental")
+		}
+		// TODO add fields for these options in types.Info
+		if !sysInfo.BlkioWeight {
+			v.Warnings = append(v.Warnings, "WARNING: No blkio weight support")
+		}
+		if !sysInfo.BlkioWeightDevice {
+			v.Warnings = append(v.Warnings, "WARNING: No blkio weight_device support")
+		}
+		if !sysInfo.BlkioReadBpsDevice {
+			v.Warnings = append(v.Warnings, "WARNING: No blkio throttle.read_bps_device support")
+		}
+		if !sysInfo.BlkioWriteBpsDevice {
+			v.Warnings = append(v.Warnings, "WARNING: No blkio throttle.write_bps_device support")
+		}
+		if !sysInfo.BlkioReadIOpsDevice {
+			v.Warnings = append(v.Warnings, "WARNING: No blkio throttle.read_iops_device support")
+		}
+		if !sysInfo.BlkioWriteIOpsDevice {
+			v.Warnings = append(v.Warnings, "WARNING: No blkio throttle.write_iops_device support")
+		}
 	}
 	if !v.IPv4Forwarding {
 		v.Warnings = append(v.Warnings, "WARNING: IPv4 forwarding is disabled")

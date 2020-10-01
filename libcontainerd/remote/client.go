@@ -50,14 +50,13 @@ type client struct {
 	eventQ          queue.Queue
 	oomMu           sync.Mutex
 	oom             map[string]bool
-	useShimV2       bool
 	v2runcoptionsMu sync.Mutex
 	// v2runcoptions is used for copying options specified on Create() to Start()
 	v2runcoptions map[string]v2runcoptions.Options
 }
 
 // NewClient creates a new libcontainerd client from a containerd client
-func NewClient(ctx context.Context, cli *containerd.Client, stateDir, ns string, b libcontainerdtypes.Backend, useShimV2 bool) (libcontainerdtypes.Client, error) {
+func NewClient(ctx context.Context, cli *containerd.Client, stateDir, ns string, b libcontainerdtypes.Backend) (libcontainerdtypes.Client, error) {
 	c := &client{
 		client:        cli,
 		stateDir:      stateDir,
@@ -65,7 +64,6 @@ func NewClient(ctx context.Context, cli *containerd.Client, stateDir, ns string,
 		ns:            ns,
 		backend:       b,
 		oom:           make(map[string]bool),
-		useShimV2:     useShimV2,
 		v2runcoptions: make(map[string]v2runcoptions.Options),
 	}
 
@@ -129,17 +127,13 @@ func (c *client) Restore(ctx context.Context, id string, attachStdio libcontaine
 	}, nil
 }
 
-func (c *client) Create(ctx context.Context, id string, ociSpec *specs.Spec, runtimeOptions interface{}, opts ...containerd.NewContainerOpts) error {
+func (c *client) Create(ctx context.Context, id string, ociSpec *specs.Spec, shim string, runtimeOptions interface{}, opts ...containerd.NewContainerOpts) error {
 	bdir := c.bundleDir(id)
 	c.logger.WithField("bundle", bdir).WithField("root", ociSpec.Root.Path).Debug("bundle dir created")
 
-	rt := runtimeName
-	if c.useShimV2 {
-		rt = shimV2RuntimeName
-	}
 	newOpts := []containerd.NewContainerOpts{
 		containerd.WithSpec(ociSpec),
-		containerd.WithRuntime(rt, runtimeOptions),
+		containerd.WithRuntime(shim, runtimeOptions),
 		WithBundle(bdir, ociSpec),
 	}
 	opts = append(opts, newOpts...)
@@ -151,12 +145,10 @@ func (c *client) Create(ctx context.Context, id string, ociSpec *specs.Spec, run
 		}
 		return wrapError(err)
 	}
-	if c.useShimV2 {
-		if x, ok := runtimeOptions.(*v2runcoptions.Options); ok {
-			c.v2runcoptionsMu.Lock()
-			c.v2runcoptions[id] = *x
-			c.v2runcoptionsMu.Unlock()
-		}
+	if x, ok := runtimeOptions.(*v2runcoptions.Options); ok {
+		c.v2runcoptionsMu.Lock()
+		c.v2runcoptions[id] = *x
+		c.v2runcoptionsMu.Unlock()
 	}
 	return nil
 }
@@ -218,17 +210,12 @@ func (c *client) Start(ctx context.Context, id, checkpointDir string, withStdin 
 
 	if runtime.GOOS != "windows" {
 		taskOpts = append(taskOpts, func(_ context.Context, _ *containerd.Client, info *containerd.TaskInfo) error {
-			if c.useShimV2 {
-				// For v2, we need to inherit options specified on Create
-				c.v2runcoptionsMu.Lock()
-				opts, ok := c.v2runcoptions[id]
-				c.v2runcoptionsMu.Unlock()
-				if !ok {
-					opts = v2runcoptions.Options{}
-				}
+			c.v2runcoptionsMu.Lock()
+			opts, ok := c.v2runcoptions[id]
+			c.v2runcoptionsMu.Unlock()
+			if ok {
 				opts.IoUid = uint32(uid)
 				opts.IoGid = uint32(gid)
-				opts.NoPivotRoot = os.Getenv("DOCKER_RAMDISK") != ""
 				info.Options = &opts
 			} else {
 				info.Options = &runctypes.CreateOptions{
@@ -237,7 +224,6 @@ func (c *client) Start(ctx context.Context, id, checkpointDir string, withStdin 
 					NoPivotRoot: os.Getenv("DOCKER_RAMDISK") != "",
 				}
 			}
-
 			return nil
 		})
 	} else {
@@ -725,6 +711,38 @@ func (c *client) processEvent(ctx context.Context, et libcontainerdtypes.EventTy
 	})
 }
 
+func (c *client) waitServe(ctx context.Context) bool {
+	t := 100 * time.Millisecond
+	delay := time.NewTimer(t)
+	if !delay.Stop() {
+		<-delay.C
+	}
+	defer delay.Stop()
+
+	// `IsServing` will actually block until the service is ready.
+	// However it can return early, so we'll loop with a delay to handle it.
+	for {
+		serving, err := c.client.IsServing(ctx)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return false
+			}
+			logrus.WithError(err).Warn("Error while testing if containerd API is ready")
+		}
+
+		if serving {
+			return true
+		}
+
+		delay.Reset(t)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-delay.C:
+		}
+	}
+}
+
 func (c *client) processEventStream(ctx context.Context, ns string) {
 	var (
 		err error
@@ -733,9 +751,16 @@ func (c *client) processEventStream(ctx context.Context, ns string) {
 		ei  libcontainerdtypes.EventInfo
 	)
 
+	// Create a new context specifically for this subscription.
+	// The context must be cancelled to cancel the subscription.
+	// In cases where we have to restart event stream processing,
+	//   we'll need the original context b/c this one will be cancelled
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// Filter on both namespace *and* topic. To create an "and" filter,
 	// this must be a single, comma-separated string
-	eventStream, errC := c.client.EventService().Subscribe(ctx, "namespace=="+ns+",topic~=|^/tasks/|")
+	eventStream, errC := c.client.EventService().Subscribe(subCtx, "namespace=="+ns+",topic~=|^/tasks/|")
 
 	c.logger.Debug("processing event stream")
 
@@ -746,14 +771,11 @@ func (c *client) processEventStream(ctx context.Context, ns string) {
 			if err != nil {
 				errStatus, ok := status.FromError(err)
 				if !ok || errStatus.Code() != codes.Canceled {
-					c.logger.WithError(err).Error("failed to get event")
-
-					// rate limit
-					select {
-					case <-time.After(time.Second):
+					c.logger.WithError(err).Error("Failed to get event")
+					c.logger.Info("Waiting for containerd to be ready to restart event processing")
+					if c.waitServe(ctx) {
 						go c.processEventStream(ctx, ns)
 						return
-					case <-ctx.Done():
 					}
 				}
 				c.logger.WithError(ctx.Err()).Info("stopping event stream following graceful shutdown")
